@@ -23,7 +23,7 @@ from skimage import measure
 from tqdm import tqdm
 
 from nuclei_seg.aug.transforms import get_val_transforms
-from nuclei_seg.datasets.dsb import get_test_ids, _pad32
+from nuclei_seg.datasets.dsb import _pad32
 from nuclei_seg.metric import instance_map_score, mean_ap
 from nuclei_seg.models.unet import load_model
 from nuclei_seg.utils import postprocess_to_instance_map, rle_decode, rle_encode
@@ -106,6 +106,27 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _predict_one(img_path: Path, model, transform, device: str, no_tta: bool):
+    """Load image, run inference, return instance label map."""
+    img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    img_padded, (t, b, l, r) = _pad32(img)
+    img_tensor = transform(image=img_padded)["image"]
+
+    if no_tta:
+        with torch.no_grad():
+            pred = model(img_tensor.unsqueeze(0).to(device))
+        pred_np = pred[0].permute(1, 2, 0).cpu().numpy()
+    else:
+        pred_np = _tta_predict(model, img_tensor, device)
+
+    ph, pw = img_padded.shape[:2]
+    pred_np = pred_np[t: ph - b if b else ph, l: pw - r if r else pw, :]
+
+    return postprocess_to_instance_map(pred_np[:, :, 0], pred_np[:, :, 1])
+
+
 def main():
     args   = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -114,52 +135,42 @@ def main():
     model = load_model(args.weights, encoder=args.encoder, device=device)
     transform = get_val_transforms()
 
-    test_ids = get_test_ids(args.data_dir)
-    print(f"Test images: {len(test_ids)}")
+    data_root = Path(args.data_dir)
+    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
 
-    # Load GT instance maps from solution CSV
+    # Load stage1 GT for local evaluation
     gt_maps = load_gt_instance_maps(args.solution_csv)
     print(f"GT instances loaded for {len(gt_maps)} images")
 
-    data_root = Path(args.data_dir)
-    Path(args.out_csv).parent.mkdir(parents=True, exist_ok=True)
+    # Collect all test images: stage1_test + stage2_test_final
+    test_subdirs = [
+        ("stage1_test",       "Stage 1"),
+        ("stage2_test_final", "Stage 2"),
+    ]
+    all_test_ids: list[tuple[str, str]] = []   # (subdir, img_id)
+    for subdir, label in test_subdirs:
+        d = data_root / subdir
+        if d.exists():
+            ids = sorted(p.name for p in d.iterdir() if p.is_dir())
+            print(f"{label} ({subdir}): {len(ids)} images")
+            all_test_ids.extend((subdir, img_id) for img_id in ids)
+
+    print(f"Total test images: {len(all_test_ids)}")
 
     submission_rows = []
     per_image_scores = []
 
-    for img_id in tqdm(test_ids, desc="Predicting"):
-        img_path = data_root / "stage1_test" / img_id / "images" / f"{img_id}.png"
-        img = cv2.imread(str(img_path), cv2.IMREAD_COLOR)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        orig_h, orig_w = img.shape[:2]
-
-        # Pad to 32-multiple
-        img_padded, (t, b, l, r) = _pad32(img)
-        augmented = transform(image=img_padded)
-        img_tensor = augmented["image"]  # (3, H_pad, W_pad)
-
-        # Inference (with or without TTA)
-        if args.no_tta:
-            with torch.no_grad():
-                pred = model(img_tensor.unsqueeze(0).to(device))
-            pred_np = pred[0].permute(1, 2, 0).cpu().numpy()
-        else:
-            pred_np = _tta_predict(model, img_tensor, device)
-
-        # Remove padding
-        ph, pw = img_padded.shape[:2]
-        pred_np = pred_np[t: ph - b if b else ph, l: pw - r if r else pw, :]
-
-        # Post-processing → instance labels
-        body_prob   = pred_np[:, :, 0]
-        border_prob = pred_np[:, :, 1]
-        pred_inst   = postprocess_to_instance_map(body_prob, border_prob)
+    for subdir, img_id in tqdm(all_test_ids, desc="Predicting"):
+        img_path = data_root / subdir / img_id / "images" / f"{img_id}.png"
+        pred_inst = _predict_one(img_path, model, transform, device, args.no_tta)
 
         # RLE-encode each predicted nucleus
+        # If no nuclei detected, add a dummy 1-pixel entry so the image ID
+        # appears in the submission (Kaggle requires all solution IDs present)
         nucleus_ids = np.unique(pred_inst)
         nucleus_ids = nucleus_ids[nucleus_ids > 0]
         if len(nucleus_ids) == 0:
-            submission_rows.append({"ImageId": img_id, "EncodedPixels": ""})
+            submission_rows.append({"ImageId": img_id, "EncodedPixels": "1 1"})
         else:
             for nid in nucleus_ids:
                 mask = (pred_inst == nid).astype(np.uint8)
