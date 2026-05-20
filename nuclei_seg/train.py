@@ -27,7 +27,9 @@ from nuclei_seg.datasets.dsb import make_datasets
 from nuclei_seg.losses import make_loss
 from nuclei_seg.metric import mean_ap, instance_map_score
 from nuclei_seg.models.unet import make_model
-from nuclei_seg.utils import postprocess_to_instance_map
+from nuclei_seg.utils import postprocess_to_instance_map, set_seed, seed_worker
+
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8' # cuBLAS deterministic  연산을 위한 workspace 크기 지정
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +45,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loss",        default="double_head")
     p.add_argument("--weights_dir", default="nuclei_seg/weights")
     p.add_argument("--num_workers", type=int,   default=0)
+    p.add_argument("--seed",        type=int,   default=42) 
     return p.parse_args()
 
 
@@ -105,8 +108,10 @@ def val_epoch(model, loader, loss_fn, device) -> tuple[float, float]:
 
 def main():
     args = parse_args()
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
+    loader_gen = torch.Generator().manual_seed(args.seed) 
 
     os.makedirs(args.weights_dir, exist_ok=True)
 
@@ -114,9 +119,11 @@ def main():
         args.data_dir, fold=args.fold, n_folds=args.n_folds, crop_size=args.crop_size
     )
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=(device == "cuda"))
+                              num_workers=args.num_workers, pin_memory=(device == "cuda"),
+                              worker_init_fn=seed_worker, generator=loader_gen)
     val_loader   = DataLoader(val_ds,   batch_size=1,              shuffle=False,
-                              num_workers=args.num_workers)
+                              num_workers=args.num_workers,
+                              worker_init_fn=seed_worker, generator=loader_gen)
 
     model    = make_model(encoder=args.encoder).to(device)
     loss_fn  = make_loss(args.loss)

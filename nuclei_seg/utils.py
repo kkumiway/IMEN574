@@ -11,6 +11,11 @@ from skimage.morphology import dilation, footprint_rectangle
 from skimage.segmentation import watershed
 from scipy import ndimage as ndi
 
+import os
+import random
+import torch
+from torch.utils.data import get_worker_info
+
 
 # ---------------------------------------------------------------------------
 # RLE
@@ -87,3 +92,34 @@ def postprocess_to_instance_map(
             ws[ws == region.label] = 0
 
     return ws.astype(np.int32)
+
+# ---------------------------------------------------------------------------
+# Set Seed
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int):
+    """
+    Fix the random seed of all Library (Python, numpy, torch .. etc.),
+    """
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+def seed_worker(worker_id):
+    """
+    Fix the random.seed in each worker in DataLoader
+    including np.random / random 
+    """
+    worker_seed = torch.initial_seed() % 2 ** 32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+    # Albumentations v2 worker별 RNG 분리
+    info = get_worker_info()
+    if info is not None and hasattr(info.dataset, 'transform') and info.dataset.transform is not None:
+        info.dataset.transform.set_random_seed(worker_seed)
