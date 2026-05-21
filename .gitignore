@@ -11,6 +11,10 @@ __pycache__/
 venv/
 env/
 
+# models
+weights/
+weights_additional/
+
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
